@@ -1,4 +1,4 @@
-#!/usr/bin/with-contenv bashio
+#!/command/with-contenv bashio
 set -euo pipefail
 
 readonly CODEX_DATA_DIR="/config/codex"
