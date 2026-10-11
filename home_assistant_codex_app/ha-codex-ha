@@ -1,7 +1,8 @@
 
 #!/usr/bin/env bash
 # Controlled Home Assistant Core actions for HA Codex.
-# The Supervisor supplies the token; it is never printed.
+# The Supervisor supplies the token and routes requests internally.
+# The token is never printed.
 set -euo pipefail
 
 readonly API_BASE="http://supervisor/core/api"
@@ -29,7 +30,7 @@ EOF
 
 require_control() {
   if [ "${HA_CODEX_HOME_ASSISTANT_CONTROL:-false}" != "true" ]; then
-    printf '%s\n' 'Home Assistant control actions are disabled.' >&2
+    printf '%s\n' 'Home Assistant control actions are disabled. Enable "Allow Home Assistant control actions" in HA Codex Configuration, then restart the add-on.' >&2
     exit 77
   fi
 }
@@ -40,7 +41,7 @@ api() {
   local payload="${3:-}"
 
   if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
-    printf '%s\n' 'Home Assistant API access is unavailable.' >&2
+    printf '%s\n' 'Home Assistant API access is unavailable. Restart HA Codex after installing this version.' >&2
     exit 78
   fi
 
@@ -53,26 +54,31 @@ api() {
     --header "Authorization: Bearer ${SUPERVISOR_TOKEN}"
     --header "Content-Type: application/json"
   )
+
   if [ -n "${payload}" ]; then
     args+=(--data "${payload}")
   fi
+
   curl "${args[@]}" "${API_BASE}${path}"
 }
 
 check_config() {
   local response
   response="$(api POST /config/core/check_config '{}')"
+
   if [ "$(printf '%s' "${response}" | jq -r '.result // empty')" != "valid" ]; then
     printf '%s\n' 'Home Assistant configuration validation failed:' >&2
     printf '%s\n' "${response}" | jq -r '.errors // .' >&2
     return 1
   fi
+
   printf '%s\n' 'Home Assistant configuration is valid.'
 }
 
 call_service() {
   local domain="$1"
   local service="$2"
+
   api POST "/services/${domain}/${service}" '{}'
   printf '%s\n' "Requested Home Assistant action: ${domain}.${service}."
 }
@@ -95,11 +101,14 @@ read_history() {
     exit 78
   fi
 
-  local start end url response
+  local start end url tmp bytes response curl_status
+  local -a pipe_status
+
   start="$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" || {
     printf '%s\n' 'Could not calculate history start time.' >&2
     exit 1
   }
+
   end="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || {
     printf '%s\n' 'Could not calculate history end time.' >&2
     exit 1
@@ -107,40 +116,81 @@ read_history() {
 
   url="${API_BASE}/history/period/${start}?filter_entity_id=${HISTORY_ENTITY}&end_time=${end}&minimal_response&no_attributes"
 
-  # curl enforces this limit when the response size is known to it.
-  # A server response without a known length may need additional protection.
-  response="$(
-    curl \
-      --fail-with-body \
-      --silent \
-      --show-error \
-      --max-time 30 \
-      --max-filesize "${HISTORY_MAX_BYTES}" \
-      --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
-      --header "Content-Type: application/json" \
-      "${url}"
-  )" || {
-    printf '%s\n' 'History request failed or exceeded the supported response size.' >&2
+  tmp="$(mktemp)" || {
+    printf '%s\n' 'Could not create a temporary file.' >&2
     exit 1
   }
 
-  if ! printf '%s' "${response}" | jq -e 'type == "array" and (length == 0 or (.[0] | type == "array"))' >/dev/null; then
+  # Read at most 1 MiB + 1 byte. The extra byte detects oversized output.
+  # If the response is larger, no partial history is returned.
+  set +e
+  curl \
+    --fail-with-body \
+    --silent \
+    --show-error \
+    --max-time 30 \
+    --header "Authorization: Bearer ${SUPERVISOR_TOKEN}" \
+    --header "Content-Type: application/json" \
+    "${url}" |
+    head -c "$((HISTORY_MAX_BYTES + 1))" > "${tmp}"
+  pipe_status=("${PIPESTATUS[@]}")
+  set -e
+
+  curl_status="${pipe_status[0]}"
+  bytes="$(wc -c < "${tmp}")"
+
+  if [ "${bytes}" -gt "${HISTORY_MAX_BYTES}" ]; then
+    rm -f "${tmp}"
+    printf '%s\n' 'History response exceeds the 1 MiB limit; no data returned.' >&2
+    exit 1
+  fi
+
+  if [ "${curl_status}" -ne 0 ]; then
+    rm -f "${tmp}"
+    printf '%s\n' 'History request failed.' >&2
+    exit 1
+  fi
+
+  response="$(cat "${tmp}")"
+  rm -f "${tmp}"
+
+  # The History API returns an outer array with one array per entity.
+  # Validate the structure and ensure all returned records match the allowlist.
+  if ! printf '%s' "${response}" |
+    jq -e --arg entity "${HISTORY_ENTITY}" '
+      type == "array" and
+      (length == 0 or
+        (.[0] |
+          type == "array" and
+          all(.[]; .entity_id == $entity)
+        )
+      )
+    ' >/dev/null; then
     printf '%s\n' 'Home Assistant returned an unexpected history response.' >&2
     exit 1
   fi
 
-  printf '%s' "${response}" | jq --arg entity "${HISTORY_ENTITY}" --arg start "${start}" --arg end "${end}" --argjson limit "${HISTORY_MAX_RECORDS}" '
-    (.[0] // []) as $records
-    | {
-        entity_id: $entity,
-        start: $start,
-        end: $end,
-        total_records: ($records | length),
-        returned_records: (($records | length) as $n | if $n > $limit then $limit else $n end),
-        truncated: (($records | length) > $limit),
-        history: ($records[-$limit:])
-      }
-  '
+  printf '%s' "${response}" |
+    jq \
+      --arg entity "${HISTORY_ENTITY}" \
+      --arg start "${start}" \
+      --arg end "${end}" \
+      --argjson limit "${HISTORY_MAX_RECORDS}" '
+        (.[0] // []) as $records
+        | {
+            entity_id: $entity,
+            start: $start,
+            end: $end,
+            total_records: ($records | length),
+            returned_records:
+              (if ($records | length) > $limit
+               then $limit
+               else ($records | length)
+               end),
+            truncated: (($records | length) > $limit),
+            history: ($records[-$limit:])
+          }
+      '
 }
 
 case "${1:-}" in
@@ -149,10 +199,12 @@ case "${1:-}" in
     api GET / >/dev/null
     printf '%s\n' 'Home Assistant Core API is reachable.'
     ;;
+
   check)
     require_control
     check_config
     ;;
+
   reload)
     require_control
     case "${2:-}" in
@@ -175,16 +227,18 @@ case "${1:-}" in
         ;;
     esac
     ;;
+
   restart)
     require_control
     if [ "${HA_CODEX_ALLOW_HOME_ASSISTANT_RESTART:-false}" != "true" ]; then
-      printf '%s\n' 'Core restart is disabled.' >&2
+      printf '%s\n' 'Core restart is disabled. Enable "Allow Home Assistant Core restart" in HA Codex Configuration, then restart the add-on.' >&2
       exit 77
     fi
     check_config
     call_service homeassistant restart
     printf '%s\n' 'Home Assistant Core is restarting. It may be unavailable briefly.'
     ;;
+
   history)
     if [ "$#" -ne 2 ]; then
       usage >&2
@@ -192,9 +246,11 @@ case "${1:-}" in
     fi
     read_history "$2"
     ;;
+
   -h|--help|help|"")
     usage
     ;;
+
   *)
     usage >&2
     exit 64
