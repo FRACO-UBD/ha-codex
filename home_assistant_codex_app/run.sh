@@ -1,3 +1,4 @@
+
 #!/usr/bin/with-contenv bashio
 set -euo pipefail
 
@@ -20,6 +21,7 @@ MODEL="$(bashio::config 'model')"
 REASONING_EFFORT="$(bashio::config 'reasoning_effort')"
 HOME_ASSISTANT_CONTROL="$(bashio::config 'home_assistant_control')"
 ALLOW_HOME_ASSISTANT_RESTART="$(bashio::config 'allow_home_assistant_restart')"
+ALLOW_HOME_ASSISTANT_HISTORY="$(bashio::config 'allow_home_assistant_history')"
 
 # "default" passes no --model, so Codex uses the model saved with /model (the
 # top-level model key in config.toml) or its own default. That saved model, when
@@ -56,6 +58,7 @@ case "${EFFORT_MODEL}" in
   "") MAX_REASONING_EFFORT="ultra" ;;
   *) MAX_REASONING_EFFORT="xhigh" ;;
 esac
+
 reasoning_effort_rank() {
   local rank=0 level
   for level in ${REASONING_EFFORT_LEVELS}; do
@@ -67,6 +70,7 @@ reasoning_effort_rank() {
   done
   printf '0'
 }
+
 if [ "$(reasoning_effort_rank "${REASONING_EFFORT}")" -gt "$(reasoning_effort_rank "${MAX_REASONING_EFFORT}")" ]; then
   REQUESTED_REASONING_EFFORT="${REASONING_EFFORT}"
   REASONING_EFFORT="${MAX_REASONING_EFFORT}"
@@ -74,6 +78,7 @@ fi
 
 export HA_CODEX_HOME_ASSISTANT_CONTROL="${HOME_ASSISTANT_CONTROL}"
 export HA_CODEX_ALLOW_HOME_ASSISTANT_RESTART="${ALLOW_HOME_ASSISTANT_RESTART}"
+export HA_CODEX_ALLOW_HOME_ASSISTANT_HISTORY="${ALLOW_HOME_ASSISTANT_HISTORY}"
 export HA_CODEX_PATCH_COMPATIBILITY_MODE="${PATCH_COMPATIBILITY_MODE}"
 export HA_CODEX_SKIP_COMMAND_APPROVALS="${SKIP_COMMAND_APPROVALS}"
 export HA_CODEX_FILE_TRANSFER="${FILE_TRANSFER}"
@@ -162,7 +167,7 @@ else
   bashio::log.info "Skip command approvals: false (default; Codex uses its own approval policy)."
 fi
 bashio::log.info "Sandbox mode applies when a Codex session starts; restart the add-on after changing it so a fresh session takes effect."
-bashio::log.info "Home Assistant control actions: ${HOME_ASSISTANT_CONTROL}; Core restart: ${ALLOW_HOME_ASSISTANT_RESTART}."
+bashio::log.info "Home Assistant control actions: ${HOME_ASSISTANT_CONTROL}; Core restart: ${ALLOW_HOME_ASSISTANT_RESTART}; History read: ${ALLOW_HOME_ASSISTANT_HISTORY}."
 if [ "${FILE_TRANSFER}" = "true" ]; then
   bashio::log.info "Terminal file transfer: true (trz/tsz enabled; may interfere with pasting long text)."
 else
@@ -174,10 +179,8 @@ else
   bashio::log.info "Codex memories: false (default; Codex keeps any setting made with /memories)."
 fi
 
-# ttyd bundles its browser client in its executable.  Extract its matching
-# page, then add one deliberately small scroll rail.  The sed replacement
-# contains no ampersands: in sed replacements an ampersand expands to the
-# matched HTML, which previously corrupted the injected markup and scripts.
+# ttyd bundles its browser client in its executable. Extract its matching page,
+# then add one deliberately small scroll rail.
 GZIP_OFFSET="$(LC_ALL=C grep -abo $'\x1f\x8b\x08' /usr/local/bin/ttyd | head -n 1 | LC_ALL=C cut -d: -f1 || true)"
 if [ -n "${GZIP_OFFSET}" ]; then
   dd if=/usr/local/bin/ttyd bs=1 skip="${GZIP_OFFSET}" 2>/dev/null | gzip -dc 2>/dev/null > "${TERMINAL_INDEX}" || true
@@ -195,11 +198,7 @@ else
   bashio::log.warning "Could not locate ttyd's browser client; using ttyd's standard page."
 fi
 
-# enableZmodem/enableTrzsz turn on ttyd's browser-side file transfer so the
-# installed trz/tsz binaries receive the client handshake. This is opt-in
-# because enabling trzsz routes terminal input through its paste/drag handler,
-# which interferes with pasting long text. It stays off unless the user turns on
-# the "Terminal file transfer" setting, so pasting works by default.
+# Enable browser-side file transfer only when explicitly requested.
 TTYD_TRANSFER_ARGS=()
 if [ "${FILE_TRANSFER}" = "true" ]; then
   TTYD_TRANSFER_ARGS=(
@@ -209,10 +208,6 @@ if [ "${FILE_TRANSFER}" = "true" ]; then
   )
 fi
 
-# tmux (and Codex) take over the mouse, so a plain drag never creates a browser
-# selection. xterm.js lets Shift+drag force one everywhere, but on macOS the
-# equivalent Option+drag is off unless this option is set. The README's copy and
-# paste instructions rely on it.
 exec /usr/local/bin/ttyd \
   --writable \
   --port 7681 \
