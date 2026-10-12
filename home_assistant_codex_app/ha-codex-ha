@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # Controlled Home Assistant Core actions for HA Codex.
 # The Supervisor supplies the token and routes requests internally.
@@ -6,7 +5,7 @@
 set -euo pipefail
 
 readonly API_BASE="http://supervisor/core/api"
-readonly HISTORY_ENTITY="sensor.betteress_stan_baterii_soc"
+readonly HISTORY_ENTITIES="sensor.betteress_stan_baterii_soc sensor.betteress_rs485_paceex_soc"
 readonly HISTORY_MAX_BYTES=1048576
 readonly HISTORY_MAX_RECORDS=500
 
@@ -20,7 +19,7 @@ Commands:
   reload <automation|script|scene|group|template|core|dashboard-resources>
                                  Reload one supported Home Assistant configuration area.
   restart                        Validate configuration, then restart Home Assistant Core.
-  history <entity_id>            Read the last 24 hours for the allowed history entity.
+  history <entity_id>            Read the last 24 hours for an allowed history entity.
 
 Control actions must be enabled in the HA Codex add-on Configuration tab.
 Core restart additionally requires "Allow Home Assistant Core restart".
@@ -91,30 +90,42 @@ read_history() {
     exit 77
   fi
 
-  if [ "${entity}" != "${HISTORY_ENTITY}" ]; then
-    printf '%s\n' "History access is restricted to ${HISTORY_ENTITY}." >&2
-    exit 77
-  fi
+  case " ${HISTORY_ENTITIES} " in
+    *" ${entity} "*) ;;
+    *)
+      printf '%s\n' "History access is restricted to: ${HISTORY_ENTITIES}." >&2
+      exit 77
+      ;;
+  esac
 
   if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
     printf '%s\n' 'Home Assistant API access is unavailable.' >&2
     exit 78
   fi
 
-  local start end url tmp bytes response curl_status
+  local now_epoch start_epoch start end url tmp bytes response curl_status
   local -a pipe_status
 
-  start="$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" || {
+  # BusyBox date does not reliably understand "24 hours ago".
+  # Calculate the time range using Unix timestamps instead.
+  now_epoch="$(date -u '+%s')" || {
+    printf '%s\n' 'Could not calculate current time.' >&2
+    exit 1
+  }
+
+  start_epoch="$((now_epoch - 86400))"
+
+  start="$(date -u -d "@${start_epoch}" '+%Y-%m-%dT%H:%M:%SZ')" || {
     printf '%s\n' 'Could not calculate history start time.' >&2
     exit 1
   }
 
-  end="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || {
+  end="$(date -u -d "@${now_epoch}" '+%Y-%m-%dT%H:%M:%SZ')" || {
     printf '%s\n' 'Could not calculate history end time.' >&2
     exit 1
   }
 
-  url="${API_BASE}/history/period/${start}?filter_entity_id=${HISTORY_ENTITY}&end_time=${end}&minimal_response&no_attributes"
+  url="${API_BASE}/history/period/${start}?filter_entity_id=${entity}&end_time=${end}&minimal_response&no_attributes"
 
   tmp="$(mktemp)" || {
     printf '%s\n' 'Could not create a temporary file.' >&2
@@ -157,7 +168,7 @@ read_history() {
   # The History API returns an outer array with one array per entity.
   # Validate the structure and ensure all returned records match the allowlist.
   if ! printf '%s' "${response}" |
-    jq -e --arg entity "${HISTORY_ENTITY}" '
+    jq -e --arg entity "${entity}" '
       type == "array" and
       (length == 0 or
         (.[0] |
@@ -172,7 +183,7 @@ read_history() {
 
   printf '%s' "${response}" |
     jq \
-      --arg entity "${HISTORY_ENTITY}" \
+      --arg entity "${entity}" \
       --arg start "${start}" \
       --arg end "${end}" \
       --argjson limit "${HISTORY_MAX_RECORDS}" '
@@ -256,3 +267,4 @@ case "${1:-}" in
     exit 64
     ;;
 esac
+```
