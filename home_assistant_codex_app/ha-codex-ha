@@ -5,7 +5,6 @@
 set -euo pipefail
 
 readonly API_BASE="http://supervisor/core/api"
-readonly HISTORY_ENTITIES="sensor.betteress_stan_baterii_soc sensor.betteress_rs485_paceex_soc"
 readonly HISTORY_MAX_BYTES=1048576
 readonly HISTORY_MAX_RECORDS=500
 
@@ -19,7 +18,7 @@ Commands:
   reload <automation|script|scene|group|template|core|dashboard-resources>
                                  Reload one supported Home Assistant configuration area.
   restart                        Validate configuration, then restart Home Assistant Core.
-  history <entity_id>            Read the last 24 hours for an allowed history entity.
+  history <entity_id>            Read the last 24 hours for an existing entity.
 
 Control actions must be enabled in the HA Codex add-on Configuration tab.
 Core restart additionally requires "Allow Home Assistant Core restart".
@@ -29,7 +28,7 @@ EOF
 
 require_control() {
   if [ "${HA_CODEX_HOME_ASSISTANT_CONTROL:-false}" != "true" ]; then
-    printf '%s\n' 'Home Assistant control actions are disabled. Enable "Allow Home Assistant control actions" in HA Codex Configuration, then restart the add-on.' >&2
+    printf '%s\n' 'Home Assistant control actions are disabled. Enable "Allow Home Assistant control actions" in HA Codex Configuration, then restart this add-on.' >&2
     exit 77
   fi
 }
@@ -90,24 +89,34 @@ read_history() {
     exit 77
   fi
 
-  case " ${HISTORY_ENTITIES} " in
-    *" ${entity} "*) ;;
-    *)
-      printf '%s\n' "History access is restricted to: ${HISTORY_ENTITIES}." >&2
-      exit 77
-      ;;
-  esac
+  # Accept only a syntactically valid domain.object entity_id.
+  if [[ ! "${entity}" =~ ^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$ ]]; then
+    printf '%s\n' 'Invalid entity_id. Expected a domain.object identifier.' >&2
+    exit 64
+  fi
 
   if [ -z "${SUPERVISOR_TOKEN:-}" ]; then
     printf '%s\n' 'Home Assistant API access is unavailable.' >&2
     exit 78
   fi
 
+  # Verify that Home Assistant currently knows this entity.
+  local state_response
+  if ! state_response="$(api GET "/states/${entity}" 2>/dev/null)"; then
+    printf '%s\n' "Entity not found or unavailable: ${entity}." >&2
+    exit 1
+  fi
+
+  if ! printf '%s' "${state_response}" |
+    jq -e --arg entity "${entity}" '.entity_id == $entity' >/dev/null; then
+    printf '%s\n' "Home Assistant did not confirm entity: ${entity}." >&2
+    exit 1
+  fi
+
   local now_epoch start_epoch start end url tmp bytes response curl_status
   local -a pipe_status
 
-  # BusyBox date does not reliably understand "24 hours ago".
-  # Calculate the time range using Unix timestamps instead.
+  # Calculate the last 24 hours using Unix timestamps.
   now_epoch="$(date -u '+%s')" || {
     printf '%s\n' 'Could not calculate current time.' >&2
     exit 1
@@ -132,8 +141,7 @@ read_history() {
     exit 1
   }
 
-  # Read at most 1 MiB + 1 byte. The extra byte detects oversized output.
-  # If the response is larger, no partial history is returned.
+  # Read at most 1 MiB + 1 byte to detect oversized output.
   set +e
   curl \
     --fail-with-body \
@@ -165,24 +173,17 @@ read_history() {
   response="$(cat "${tmp}")"
   rm -f "${tmp}"
 
-  # The History API returns an outer array with one array per entity.
-  # Validate the History API response.
-  # Some response formats may omit entity_id from individual records.
-  # The requested entity is already restricted by the allowlist above.
+  # Validate the History API response structure.
   if ! printf '%s' "${response}" |
-    jq -e --arg entity "${entity}" '
+    jq -e '
       type == "array" and
-      (length == 0 or
-        (.[0] |
-          type == "array" and
-          all(.[]; ((has("entity_id") | not) or .entity_id == $entity))
-        )
-      )
+      (length == 0 or (.[0] | type == "array"))
     ' >/dev/null; then
     printf '%s\n' 'Home Assistant returned an unexpected history response.' >&2
     exit 1
   fi
 
+  # Return a bounded result for the requested entity.
   printf '%s' "${response}" |
     jq \
       --arg entity "${entity}" \
@@ -244,7 +245,7 @@ case "${1:-}" in
   restart)
     require_control
     if [ "${HA_CODEX_ALLOW_HOME_ASSISTANT_RESTART:-false}" != "true" ]; then
-      printf '%s\n' 'Core restart is disabled. Enable "Allow Home Assistant Core restart" in HA Codex Configuration, then restart the add-on.' >&2
+      printf '%s\n' 'Core restart is disabled. Enable "Allow Home Assistant Core restart" in HA Codex Configuration, then restart this add-on.' >&2
       exit 77
     fi
     check_config
