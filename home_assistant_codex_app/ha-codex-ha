@@ -166,14 +166,16 @@ read_history() {
   rm -f "${tmp}"
 
   # The History API returns an outer array with one array per entity.
-  # Validate the structure and ensure all returned records match the allowlist.
+  # Validate the History API response.
+  # Some response formats may omit entity_id from individual records.
+  # The requested entity is already restricted by the allowlist above.
   if ! printf '%s' "${response}" |
     jq -e --arg entity "${entity}" '
       type == "array" and
       (length == 0 or
         (.[0] |
           type == "array" and
-          all(.[]; .entity_id == $entity)
+          all(.[]; ((has("entity_id") | not) or .entity_id == $entity))
         )
       )
     ' >/dev/null; then
