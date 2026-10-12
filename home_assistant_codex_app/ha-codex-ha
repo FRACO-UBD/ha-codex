@@ -15,18 +15,23 @@ Usage: ha-codex-ha <command>
 
 Commands:
   status
+                                 Check that the Home Assistant Core API is reachable.
   check
+                                 Validate configuration.yaml and included configuration.
   reload <automation|script|scene|group|template|core|dashboard-resources>
+                                 Reload one supported Home Assistant configuration area.
   restart
+                                 Validate configuration, then restart Home Assistant Core.
   history <entity_id> [start_utc end_utc]
+                                 Read history for an existing entity.
 
 History:
   Without dates, reads the last 24 hours.
-  Dates must use UTC format: YYYY-MM-DDTHH:MM:SSZ
-  Custom range: maximum 7 days.
+  Custom dates must use UTC format: YYYY-MM-DDTHH:MM:SSZ
+  Custom range is limited to 7 days.
   Each response is limited to 500 records and 1 MiB.
 
-Control actions must be enabled in HA Codex Configuration.
+Control actions must be enabled in the HA Codex add-on Configuration tab.
 Core restart additionally requires "Allow Home Assistant Core restart".
 History additionally requires "Allow Home Assistant history read".
 EOF
@@ -97,6 +102,7 @@ read_history() {
     exit 77
   fi
 
+  # Accept only a syntactically valid domain.object entity_id.
   if [[ ! "${entity}" =~ ^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$ ]]; then
     printf '%s\n' 'Invalid entity_id. Expected a domain.object identifier.' >&2
     exit 64
@@ -107,6 +113,7 @@ read_history() {
     exit 78
   fi
 
+  # Both custom dates must be provided together.
   if { [ -n "${requested_start}" ] && [ -z "${requested_end}" ]; } ||
      { [ -z "${requested_start}" ] && [ -n "${requested_end}" ]; }; then
     printf '%s\n' 'Provide both start_utc and end_utc, or neither.' >&2
@@ -123,21 +130,28 @@ read_history() {
   }
 
   if [ -z "${requested_start}" ]; then
+    # Default behavior remains the last 24 hours.
     start_epoch="$((now_epoch - 86400))"
     end_epoch="${now_epoch}"
   else
+    # Require explicit UTC timestamps.
     if [[ ! "${requested_start}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
        [[ ! "${requested_end}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
       printf '%s\n' 'Invalid date format. Use YYYY-MM-DDTHH:MM:SSZ in UTC.' >&2
       exit 64
     fi
 
-    start_epoch="$(date -u -d "${requested_start}" '+%s')" || {
+    # BusyBox date requires an explicit input format for ISO timestamps.
+    start_epoch="$(
+      date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "${requested_start}" '+%s'
+    )" || {
       printf '%s\n' 'Invalid history start time.' >&2
       exit 64
     }
 
-    end_epoch="$(date -u -d "${requested_end}" '+%s')" || {
+    end_epoch="$(
+      date -u -D "%Y-%m-%dT%H:%M:%SZ" -d "${requested_end}" '+%s'
+    )" || {
       printf '%s\n' 'Invalid history end time.' >&2
       exit 64
     }
@@ -158,16 +172,21 @@ read_history() {
     exit 64
   fi
 
-  start="$(date -u -d "@${start_epoch}" '+%Y-%m-%dT%H:%M:%SZ')" || {
+  start="$(
+    date -u -d "@${start_epoch}" '+%Y-%m-%dT%H:%M:%SZ'
+  )" || {
     printf '%s\n' 'Could not format history start time.' >&2
     exit 1
   }
 
-  end="$(date -u -d "@${end_epoch}" '+%Y-%m-%dT%H:%M:%SZ')" || {
+  end="$(
+    date -u -d "@${end_epoch}" '+%Y-%m-%dT%H:%M:%SZ'
+  )" || {
     printf '%s\n' 'Could not format history end time.' >&2
     exit 1
   }
 
+  # Verify that Home Assistant currently knows this entity.
   local state_response
   if ! state_response="$(api GET "/states/${entity}" 2>/dev/null)"; then
     printf '%s\n' "Entity not found or unavailable: ${entity}." >&2
@@ -187,6 +206,7 @@ read_history() {
     exit 1
   }
 
+  # Read at most 1 MiB + 1 byte to detect oversized output.
   set +e
   curl \
     --fail-with-body \
@@ -218,6 +238,7 @@ read_history() {
   response="$(cat "${tmp}")"
   rm -f "${tmp}"
 
+  # Validate the History API response structure.
   if ! printf '%s' "${response}" |
     jq -e '
       type == "array" and
@@ -227,6 +248,7 @@ read_history() {
     exit 1
   fi
 
+  # Return at most 500 most recent records from the requested interval.
   printf '%s' "${response}" |
     jq \
       --arg entity "${entity}" \
